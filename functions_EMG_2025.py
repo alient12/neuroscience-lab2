@@ -173,6 +173,131 @@ def extract_features(signal):
     # return np.array([mav, rms, var, zc, wl, ssc, wamp, iemg])
     return np.array([rms, wl, wamp])
 
+def compute_activity(signal):
+    """Mesure simple d'activité (RMS)"""
+    return np.sqrt(np.mean(signal**2))
+
+import pandas as pd
+import numpy as np
+
+def compute_activity(signal):
+    """Mesure simple d'activité (RMS)"""
+    return np.sqrt(np.mean(signal**2))
+
+
+def filter_emg(signal, fs):
+    """
+    Filtrage EMG complet (notch + passe-bande) - CAUSAL
+
+    Parameters:
+    - signal : array (signal brut)
+    - fs : fréquence d'échantillonnage (Hz)
+
+    Returns:
+    - signal filtré
+    """
+
+    # ---------- 1. NOTCH FILTER (bruit secteur) ----------
+    notch_freq=60
+    Q = 30  # facteur de qualité
+    b_notch, a_notch = iirnotch(notch_freq, Q, fs)
+    signal = lfilter(b_notch, a_notch, signal)
+
+    # ---------- 2. PASSE-BANDE ----------
+    lowcut=20
+    highcut=450
+    order=4
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+
+    b_band, a_band = butter(order, [low, high], btype='band')
+    signal = lfilter(b_band, a_band, signal)
+
+    return signal
+
+def generate_labels_from_data(data_file, window_size, output_label_file):
+    """
+    Génère automatiquement les labels à partir du signal EMG
+
+    Hypothèses :
+    - ch1 = extension (label 1)
+    - ch2 = flexion (label 2)
+    - repos = 0
+    """
+
+    fs = 1000
+
+    # ---------- 1. Charger données ----------
+    data = pd.read_csv(data_file)
+
+    signal1 = data["voltage1 (V)"].values
+    signal2 = data["voltage2 (V)"].values
+
+    # ---------- 🔥 2. FILTRAGE ----------
+    signal1 = filter_emg(signal1, fs)
+    signal2 = filter_emg(signal2, fs)
+
+    num_samples = len(signal1)
+    num_windows = num_samples // window_size
+
+    labels = []
+
+    # ---------- 2. Calcul activité globale pour seuil ----------
+    # (important pour adapter au signal réel)
+    activity_all = []
+
+    for i in range(num_windows):
+        start = i * window_size
+        end = start + window_size
+
+        w1 = signal1[start:end]
+        w2 = signal2[start:end]
+
+        act = compute_activity(w1) + compute_activity(w2)
+        activity_all.append(act)
+
+    # seuil adaptatif
+    threshold = 0.2 * np.max(activity_all)
+
+    print("Seuil utilisé :", threshold)
+
+    # ---------- 3. Génération des labels ----------
+    for i in range(num_windows):
+
+        # 👉 premières fenêtres = repos
+        if i < 3:
+            labels.append(0)
+            continue
+
+        start = i * window_size
+        end = start + window_size
+
+        w1 = signal1[start:end]
+        w2 = signal2[start:end]
+
+        act1 = compute_activity(w1)
+        act2 = compute_activity(w2)
+
+        # décision
+        if act1 < threshold and act2 < threshold:
+            label = 0
+        elif act1 > act2:
+            label = 1  # extension (ch1)
+        else:
+            label = 2  # flexion (ch2)
+
+        labels.append(label)
+
+    # ---------- 4. Sauvegarde ----------
+    pd.DataFrame(labels).to_csv(output_label_file, index=False, header=False)
+
+    print("Labels générés et sauvegardés dans :", output_label_file)
+
+    return labels
+
+
+
 def train_classifier(file_name, window_size):
     """
     Entraîne un classifieur EMG avec normalisation
@@ -185,6 +310,13 @@ def train_classifier(file_name, window_size):
     # frame = inspect.currentframe().f_back
     # file_name = frame.f_globals.get(base64.b64decode("RU1HMl9maWxl").decode())
     # label_file = frame.f_globals.get(base64.b64decode("bGFiZWwyX2ZpbGU=").decode())
+
+    labels = generate_labels_from_data(
+        "train1_data.csv",
+        window_size=50,
+        output_label_file="train1_labelsgen03.csv"
+    )
+    label_file = "train1_labelsgen03.csv"
 
     data = pd.read_csv(file_name)
     labels = pd.read_csv(label_file).values.flatten()
