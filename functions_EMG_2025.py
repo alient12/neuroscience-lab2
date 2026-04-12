@@ -5,7 +5,15 @@ import numpy as np
 import csv
 from datetime import datetime
 from dataclasses import dataclass
+from scipy.signal import butter, lfilter, iirnotch
+from sklearn.preprocessing import StandardScaler
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+import inspect, base64
 
+fs=240
+ONLINE = False
+label_threshold = 0.1
+sequence = [1, 2, 1, 2, 1, 1, 2, 2]
 
 def create_new_sampling_file(path, name):
     # complete file name with unique ID
@@ -57,32 +65,10 @@ def acquire_training_dataset(ch1, ch2, window_size, num_window, file_name):
     # frequency sampling calculation
     total_samples = window_size * num_window
     elapsed_time = end_time - start_time
+    global fs
     fs = total_samples / elapsed_time
     print("frequence acquisition : " + str(round(fs, 2)) + " sps")
 
-
-def acquire_training_dataset_buzzer(ch1, ch2, window_size, num_window, file_name, buzzer):
-    # file opening in append mode
-    file = open(file_name, 'a', newline="")
-    training_writer = csv.writer(file)
-
-    # acquisition loop
-    print("debut acquisition")
-    start_time = time.time()
-    buzzer.start(10)
-    
-    for window in range(num_window):
-        acquire_window(ch1, ch2, window_size, training_writer)
-    
-    end_time = time.time()
-    file.close()
-    buzzer.start(0)
-
-    # frequency sampling calculation
-    total_samples = window_size * num_window
-    elapsed_time = end_time - start_time
-    fs = total_samples / elapsed_time
-    print("frequence acquisition : " + str(round(fs, 2)) + " sps")
 
 def visualize_sampling(file):
     data = pd.read_csv(file)
@@ -98,10 +84,6 @@ def visualize_sampling(file):
     plt.legend()
     plt.show()
 
-from scipy.signal import butter, lfilter, iirnotch
-from sklearn.preprocessing import StandardScaler
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-import inspect, base64
 
 def filter_emg(signal, fs):
     """
@@ -115,19 +97,9 @@ def filter_emg(signal, fs):
     - signal filtré
     """
 
-    # ---------- 1. NOTCH FILTER (bruit secteur) ----------
-    notch_freq=60
-    Q = 30  # facteur de qualité
-    # notch_freq=60
-    # Q = 25  # facteur de qualité
-    b_notch, a_notch = iirnotch(notch_freq, Q, fs)
-    signal = lfilter(b_notch, a_notch, signal)
-
     # ---------- 2. PASSE-BANDE ----------
     lowcut=20
-    highcut=450
-    # lowcut=25
-    # highcut=450
+    highcut=100
     order=4
     nyquist = 0.5 * fs
     low = lowcut / nyquist
@@ -137,6 +109,221 @@ def filter_emg(signal, fs):
     signal = lfilter(b_band, a_band, signal)
 
     return signal
+
+
+# ============================================= Label Generation (humain) ============================================= #
+
+
+
+# Calculate the list of 0 with minimum 0
+
+def min_zero_sequences(lst):
+    lengths = set()
+    count = 0
+
+    for x in lst:
+        if x == 0:
+            count += 1
+        else:
+            if count >= 3:
+                lengths.add(count)
+            count = 0
+
+    # gérer la fin
+    if count >= 3:
+        lengths.add(count)
+
+    return min(lengths)
+
+
+# Processing of the signal
+
+def remove_isolated_movements(labels, zero_padding=2):
+    cleaned = labels.copy()
+    n = len(labels)
+
+    for i in range(n):
+        if labels[i] != 0:
+            # vérifier zéros à gauche
+            left_ok = all(
+                i - j >= 0 and labels[i - j] == 0
+                for j in range(1, zero_padding + 1)
+            )
+
+            # vérifier zéros à droite
+            right_ok = all(
+                i + j < n and labels[i + j] == 0
+                for j in range(1, zero_padding + 1)
+            )
+
+            if left_ok and right_ok:
+                cleaned[i] = 0  # bruit → supprimé
+
+    return cleaned
+
+def segment_signal(labels, liste_0):
+    segments = []
+    current = []
+    zero_count = 0
+
+    for x in labels:
+        current.append(x)
+
+        if x == 0:
+            zero_count += 1
+        else:
+            if zero_count >= liste_0:
+                split_index = len(current) - (zero_count + 1)
+
+                if split_index > 0:
+                    segments.append(current[:split_index])
+
+                segments.append([0] * zero_count)
+                current = [x]
+
+            zero_count = 0
+
+    # 🔥 CORRECTION FIN DE SIGNAL
+    if current:
+        if zero_count >= liste_0:
+            split_index = len(current) - zero_count
+
+            if split_index > 0:
+                segments.append(current[:split_index])
+
+            segments.append([0] * zero_count)
+        else:
+            segments.append(current)
+
+    return segments
+
+
+
+def correct_segments(segments, sequence):
+    corrected_segments = []
+    movement_idx = 0
+
+    for seg in segments:
+        # détecter si c'est un mouvement (pas que des 0)
+        if all(x == 0 for x in seg):
+            corrected_segments.append(seg)
+        else:
+            if movement_idx < len(sequence):
+                target = sequence[movement_idx]
+                movement_idx += 1
+            else:
+                target = seg[0]  # fallback
+
+            corrected_segments.append([target] * len(seg))
+
+    return corrected_segments
+
+def reconstruct_signal(segments):
+    result = []
+    for seg in segments:
+        result.extend(seg)
+    return result
+
+
+def process_signal(labels, liste_0, sequence):
+
+    labels_clean = remove_isolated_movements(labels, zero_padding=2)
+    segments = segment_signal(labels_clean, liste_0)
+    corrected_segments = correct_segments(segments, sequence)
+    final_signal = reconstruct_signal(corrected_segments)
+
+    return final_signal, segments, corrected_segments
+
+
+def generate_labels_from_data(data_file, window_size, output_label_file, threshold):
+    """
+    Génère automatiquement les labels à partir du signal EMG
+
+    Hypothèses :
+    - ch1 = extension (label 1)
+    - ch2 = flexion (label 2)
+    - repos = 0
+    """
+
+    # ---------- 1. Charger données ----------
+    data = pd.read_csv(data_file)
+
+    signal1 = data["voltage1 (V)"].values
+    signal2 = data["voltage2 (V)"].values
+
+    # ---------- 🔥 2. FILTRAGE ----------
+    signal1 = filter_emg(signal1, fs)
+    signal2 = filter_emg(signal2, fs)
+
+    num_samples = len(signal1)
+    num_windows = num_samples // window_size
+
+    labels = []
+
+    # ---------- 3. Génération des labels ----------
+    for i in range(num_windows):
+
+        # 👉 premières fenêtres = repos
+        if i < 3:
+            labels.append(0)
+            continue
+
+        start = i * window_size
+        end = start + window_size
+
+        w1 = signal1[start:end]
+        w2 = signal2[start:end]
+
+        max_w1 = np.max(w1)
+        max_w2 = np.max(w2)
+
+        # décision
+        if max_w1 > threshold or max_w2 > threshold:
+            label = 4
+        else:
+            label = 0
+        labels.append(label)
+
+    liste_0 = min_zero_sequences(labels)
+    final_labels, segments, corrected_segments = process_signal(labels, liste_0, sequence)
+
+    # ---------- 4. Sauvegarde ----------
+
+    print(final_labels)
+    #print(labels)
+    #print(segments)
+    #print("min 0 = ", liste_0)
+
+    pd.DataFrame(final_labels).to_csv(output_label_file, index=False, header=False)
+
+    print("Labels générés et sauvegardés dans :", output_label_file)
+
+    return final_labels
+
+
+def visualize_sampling_filter(file, threshold, fs):
+    data = pd.read_csv(file)
+
+    v1 = data["voltage1 (V)"].values
+    v2 = data["voltage2 (V)"].values
+
+    v1 = filter_emg(v1, fs)
+    v2 = filter_emg(v2, fs)
+
+    x = range(0, len(v1))
+
+    plt.plot(x, v1, label="voltage1 (V) (filtré)")
+    plt.plot(x, v2, label="voltage2 (V) (filtré)")
+
+    # threshold
+    plt.axhline(y=threshold, linestyle='--', label="threshold")
+
+    plt.title("Plot of Sensors Voltages (filtrés)")
+    plt.legend()
+    plt.show()
+
+# ================================================ Classifier ================================================ #
+
 
 def extract_features(signal):
     """
@@ -173,150 +360,46 @@ def extract_features(signal):
     # return np.array([mav, rms, var, zc, wl, ssc, wamp, iemg])
     return np.array([rms, wl, wamp])
 
-def compute_activity(signal):
-    """Mesure simple d'activité (RMS)"""
-    return np.sqrt(np.mean(signal**2))
-
-import pandas as pd
-import numpy as np
-
-def compute_activity(signal):
-    """Mesure simple d'activité (RMS)"""
-    return np.sqrt(np.mean(signal**2))
-
-
-def filter_emg(signal, fs):
-    """
-    Filtrage EMG complet (notch + passe-bande) - CAUSAL
-
-    Parameters:
-    - signal : array (signal brut)
-    - fs : fréquence d'échantillonnage (Hz)
-
-    Returns:
-    - signal filtré
-    """
-
-    # ---------- 1. NOTCH FILTER (bruit secteur) ----------
-    notch_freq=60
-    Q = 30  # facteur de qualité
-    b_notch, a_notch = iirnotch(notch_freq, Q, fs)
-    signal = lfilter(b_notch, a_notch, signal)
-
-    # ---------- 2. PASSE-BANDE ----------
-    lowcut=20
-    highcut=450
-    order=4
-    nyquist = 0.5 * fs
-    low = lowcut / nyquist
-    high = highcut / nyquist
-
-    b_band, a_band = butter(order, [low, high], btype='band')
-    signal = lfilter(b_band, a_band, signal)
-
-    return signal
-
-def generate_labels_from_data(data_file, window_size, output_label_file):
-    """
-    Génère automatiquement les labels à partir du signal EMG
-
-    Hypothèses :
-    - ch1 = extension (label 1)
-    - ch2 = flexion (label 2)
-    - repos = 0
-    """
-
-    fs = 1000
-
-    # ---------- 1. Charger données ----------
-    data = pd.read_csv(data_file)
-
-    signal1 = data["voltage1 (V)"].values
-    signal2 = data["voltage2 (V)"].values
-
-    # ---------- 🔥 2. FILTRAGE ----------
-    signal1 = filter_emg(signal1, fs)
-    signal2 = filter_emg(signal2, fs)
-
-    num_samples = len(signal1)
-    num_windows = num_samples // window_size
-
-    labels = []
-
-    # ---------- 2. Calcul activité globale pour seuil ----------
-    # (important pour adapter au signal réel)
-    activity_all = []
-
-    for i in range(num_windows):
-        start = i * window_size
-        end = start + window_size
-
-        w1 = signal1[start:end]
-        w2 = signal2[start:end]
-
-        act = compute_activity(w1) + compute_activity(w2)
-        activity_all.append(act)
-
-    # seuil adaptatif
-    threshold = 0.2 * np.max(activity_all)
-
-    print("Seuil utilisé :", threshold)
-
-    # ---------- 3. Génération des labels ----------
-    for i in range(num_windows):
-
-        # 👉 premières fenêtres = repos
-        if i < 3:
-            labels.append(0)
-            continue
-
-        start = i * window_size
-        end = start + window_size
-
-        w1 = signal1[start:end]
-        w2 = signal2[start:end]
-
-        act1 = compute_activity(w1)
-        act2 = compute_activity(w2)
-
-        # décision
-        if act1 < threshold and act2 < threshold:
-            label = 0
-        elif act1 > act2:
-            label = 1  # extension (ch1)
-        else:
-            label = 2  # flexion (ch2)
-
-        labels.append(label)
-
-    # ---------- 4. Sauvegarde ----------
-    pd.DataFrame(labels).to_csv(output_label_file, index=False, header=False)
-
-    print("Labels générés et sauvegardés dans :", output_label_file)
-
-    return labels
-
-
 
 def train_classifier(file_name, window_size):
     """
     Entraîne un classifieur EMG avec normalisation
     """
 
-    fs = 1000
     # ---------- 1. Charger les données ----------
-    label_file = "train1_labels.csv" if "train" in file_name.lower() else "test1_labels.csv"
+    # label_file = "train1_labels.csv" if "train" in file_name.lower() else "test1_labels.csv"
 
     # frame = inspect.currentframe().f_back
     # file_name = frame.f_globals.get(base64.b64decode("RU1HMl9maWxl").decode())
     # label_file = frame.f_globals.get(base64.b64decode("bGFiZWwyX2ZpbGU=").decode())
 
+    global label_threshold
+    print(f"file_name: {file_name}")
+    label_file = file_name
+    label_file = label_file.replace(".csv", "_labels.csv")
+    print(f"file_name: {file_name}")
+    print(f"label_file: {label_file}")
+
+    visualize_sampling(file_name)
+    visualize_sampling_filter(file_name, threshold=label_threshold, fs=fs)
+    while ONLINE:
+        # get threshold from user. pass yes if satisfied, else repeat
+        user_input = input("Put threshold for label generation (or 'yes' to confirm): ")
+        if user_input.lower() == 'yes':
+            break
+        else:
+            try:
+                label_threshold = float(user_input)
+            except ValueError:
+                print("Invalid input. Please enter a number or 'yes'.")
+        visualize_sampling_filter(file_name, threshold=label_threshold, fs=fs)
+
     labels = generate_labels_from_data(
-        "train1_data.csv",
-        window_size=50,
-        output_label_file="train1_labelsgen03.csv"
+        file_name,
+        window_size=window_size,
+        output_label_file=label_file,
+        threshold = label_threshold
     )
-    label_file = "train1_labelsgen03.csv"
 
     data = pd.read_csv(file_name)
     labels = pd.read_csv(label_file).values.flatten()
@@ -395,8 +478,6 @@ def test_classifier(classif, ch1, ch2, window_size, num_window, buzzer, label_fi
     - fs : fréquence d'échantillonnage
     - buzzer : instance PWM
     """
-
-    fs = 1000
 
     buffer1 = []
     buffer2 = []
