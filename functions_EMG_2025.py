@@ -255,7 +255,9 @@ def generate_labels_from_data(data_file, window_size, output_label_file, thresho
     signal1 = filter_emg(signal1, fs)
     signal2 = filter_emg(signal2, fs)
 
-    num_samples = len(signal1)
+    signal = signal1 + signal2
+
+    num_samples = len(signal)
     num_windows = num_samples // window_size
 
     labels = []
@@ -274,11 +276,12 @@ def generate_labels_from_data(data_file, window_size, output_label_file, thresho
         w1 = signal1[start:end]
         w2 = signal2[start:end]
 
-        max_w1 = np.max(w1)
-        max_w2 = np.max(w2)
+        w = w1 + w2
+
+        max_w = np.max(w)
 
         # décision
-        if max_w1 > threshold or max_w2 > threshold:
+        if max_w > threshold:
             label = 4
         else:
             label = 0
@@ -310,10 +313,11 @@ def visualize_sampling_filter(file, threshold, fs):
     v1 = filter_emg(v1, fs)
     v2 = filter_emg(v2, fs)
 
-    x = range(0, len(v1))
+    v = v1 + v2
 
-    plt.plot(x, v1, label="voltage1 (V) (filtré)")
-    plt.plot(x, v2, label="voltage2 (V) (filtré)")
+    x = range(0, len(v))
+
+    plt.plot(x, v, label="voltage (V) (filtré)", color='orange')
 
     # threshold
     plt.axhline(y=threshold, linestyle='--', label="threshold")
@@ -380,7 +384,6 @@ def train_classifier(file_name, window_size):
     print(f"file_name: {file_name}")
     print(f"label_file: {label_file}")
 
-    visualize_sampling(file_name)
     visualize_sampling_filter(file_name, threshold=label_threshold, fs=fs)
     while ONLINE:
         # get threshold from user. pass yes if satisfied, else repeat
@@ -466,7 +469,7 @@ def train_classifier(file_name, window_size):
     return classif
 
 
-def test_classifier(classif, ch1, ch2, window_size, num_window, buzzer, label_file):
+def test_classifier(classif, ch1, ch2, window_size, num_window, buzzer, file_name):
     """
     Classification EMG en temps réel
 
@@ -489,10 +492,17 @@ def test_classifier(classif, ch1, ch2, window_size, num_window, buzzer, label_fi
 
     print("Démarrage classification temps réel...")
 
+    file = open(file_name, 'w', newline="")
+    writer = csv.writer(file)
+    feilds = ['voltage1 (V)', 'voltage2 (V)']
+    writer.writerow(feilds)
+
     while True:
         # ---------- 1. Acquisition ----------
         sample1 = ch1.voltage
         sample2 = ch2.voltage
+
+        writer.writerow([sample1, sample2])
 
         buffer1.append(sample1)
         buffer2.append(sample2)
@@ -547,7 +557,10 @@ def test_classifier(classif, ch1, ch2, window_size, num_window, buzzer, label_fi
         # ---------- 9. Petite pause ----------
         time.sleep(1 / fs)
     
+    file.close()
+    
     #save labels
+    label_file = file_name.replace(".csv", "_predicted_labels.csv")
     with open(label_file, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['label'])
