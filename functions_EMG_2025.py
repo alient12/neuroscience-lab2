@@ -10,9 +10,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 import inspect, base64
 
-fs=240
-ONLINE = False
-label_threshold = 0.1
+fs=1000
 sequence = [1, 2, 1, 2, 1, 1, 2, 2]
 
 def create_new_sampling_file(path, name):
@@ -65,7 +63,7 @@ def acquire_training_dataset(ch1, ch2, window_size, num_window, file_name):
     # frequency sampling calculation
     total_samples = window_size * num_window
     elapsed_time = end_time - start_time
-    global fs
+    # global fs
     fs = total_samples / elapsed_time
     print("frequence acquisition : " + str(round(fs, 2)) + " sps")
 
@@ -85,6 +83,7 @@ def visualize_sampling(file):
     plt.show()
 
 
+
 def filter_emg(signal, fs):
     """
     Filtrage EMG complet (notch + passe-bande) - CAUSAL
@@ -97,9 +96,17 @@ def filter_emg(signal, fs):
     - signal filtré
     """
 
+    # ---------- 1. NOTCH FILTER (bruit secteur) ----------
+    # notch_freq=60
+    # Q = 30  # facteur de qualité
+    # # notch_freq=60
+    # # Q = 25  # facteur de qualité
+    # b_notch, a_notch = iirnotch(notch_freq, Q, fs)
+    # signal = lfilter(b_notch, a_notch, signal)
+
     # ---------- 2. PASSE-BANDE ----------
     lowcut=20
-    highcut=100
+    highcut=450
     order=4
     nyquist = 0.5 * fs
     low = lowcut / nyquist
@@ -109,7 +116,6 @@ def filter_emg(signal, fs):
     signal = lfilter(b_band, a_band, signal)
 
     return signal
-
 
 # ============================================= Label Generation (humain) ============================================= #
 
@@ -326,6 +332,174 @@ def visualize_sampling_filter(file, threshold, fs):
     plt.legend()
     plt.show()
 
+# ================================================ My Label Generation ================================================ #
+
+from scipy.signal import medfilt, find_peaks
+
+
+def robust_sigma(x):
+    med = np.median(x)
+    mad = np.median(np.abs(x - med))
+    return 1.4826 * mad + 1e-12
+
+
+def moving_average(x, k=3):
+    if k <= 1:
+        return x.copy()
+    pad = k // 2
+    xp = np.pad(x, (pad, pad), mode="edge")
+    return np.convolve(xp, np.ones(k) / k, mode="valid")
+
+
+def generate_labels(csv_path, window_size=50, pattern=(1, 2, 1, 2, 1, 1, 2, 2)):
+    """
+    Generate one label per window of size `window_size`.
+
+    Returns:
+        labels: numpy array of shape (num_windows,)
+    """
+
+    df = pd.read_csv(csv_path)
+
+    # first two columns are voltage1 and voltage2
+    v1 = df.iloc[:, 0].to_numpy(dtype=float)
+    v2 = df.iloc[:, 1].to_numpy(dtype=float)
+
+    n_use = (len(v1) // window_size) * window_size
+    v1 = v1[:n_use]
+    v2 = v2[:n_use]
+
+    # --------------------------------------------------
+    # 1) Remove slow baseline drift
+    # --------------------------------------------------
+    baseline_kernel = 51
+    b1 = medfilt(v1, baseline_kernel)
+    b2 = medfilt(v2, baseline_kernel)
+
+    r1 = v1 - b1
+    r2 = v2 - b2
+
+    # --------------------------------------------------
+    # 2) Add derivative features to capture sharp spikes
+    # --------------------------------------------------
+    d1 = np.diff(v1, prepend=v1[0])
+    d2 = np.diff(v2, prepend=v2[0])
+
+    # --------------------------------------------------
+    # 3) Estimate noise from the first few windows
+    # --------------------------------------------------
+    noise_frames = min(8 * window_size, n_use)
+
+    zr1 = np.abs(r1) / robust_sigma(r1[:noise_frames])
+    zr2 = np.abs(r2) / robust_sigma(r2[:noise_frames])
+    zd1 = np.abs(d1) / robust_sigma(d1[:noise_frames])
+    zd2 = np.abs(d2) / robust_sigma(d2[:noise_frames])
+
+    # amplitude + sharpness
+    sample_score = np.maximum(zr1, zr2) + 0.5 * np.maximum(zd1, zd2)
+
+    # --------------------------------------------------
+    # 4) Convert to one score per 50-sample window
+    # --------------------------------------------------
+    num_windows = n_use // window_size
+    score = np.array([
+        np.percentile(sample_score[i * window_size:(i + 1) * window_size], 90)
+        for i in range(num_windows)
+    ])
+
+    score_s = moving_average(score, k=3)
+
+    # --------------------------------------------------
+    # 5) Detect the 8 strongest peaks
+    # --------------------------------------------------
+    peaks, _ = find_peaks(
+        score_s,
+        distance=6,
+        prominence=max(0.1, 0.1 * np.std(score_s)),
+    )
+
+    if len(peaks) > 0:
+        peaks = peaks[np.argsort(score_s[peaks])[::-1][:len(pattern)]]
+        peaks = np.sort(peaks)
+
+    # fallback: if not enough peaks, fill with strongest remaining windows
+    chosen = list(peaks)
+    for p in np.argsort(score_s)[::-1]:
+        if all(abs(int(p) - int(q)) >= 6 for q in chosen):
+            chosen.append(int(p))
+            if len(chosen) == len(pattern):
+                break
+
+    peaks = np.array(sorted(chosen[:len(pattern)]), dtype=int)
+
+    # --------------------------------------------------
+    # 6) Use valleys between peaks to define event limits
+    # --------------------------------------------------
+    boundaries = [0]
+    for a, b in zip(peaks[:-1], peaks[1:]):
+        lo = a + 1
+        hi = b
+        m = lo + np.argmin(score_s[lo:hi]) if hi > lo else lo
+        boundaries.append(int(m))
+    boundaries.append(len(score_s) - 1)
+
+    # --------------------------------------------------
+    # 7) Expand each peak into a region with duration limits
+    # --------------------------------------------------
+    regions = []
+    min_len = 5
+    max_len = 9
+    alpha = 0.4
+
+    for i, p in enumerate(peaks):
+        left_lim = boundaries[i]
+        right_lim = boundaries[i + 1]
+
+        # local threshold between valley floor and peak height
+        bg = min(score_s[left_lim], score_s[right_lim])
+        thr = bg + alpha * (score_s[p] - bg)
+
+        l = p
+        while l > left_lim and score_s[l - 1] >= thr:
+            l -= 1
+
+        r = p
+        while r < right_lim and score_s[r + 1] >= thr:
+            r += 1
+
+        # enforce realistic event duration
+        if (r - l + 1) < min_len:
+            extra = min_len - (r - l + 1)
+            l = max(left_lim, l - extra // 2)
+            r = min(right_lim, r + (extra - extra // 2))
+
+            while (r - l + 1) < min_len:
+                if l > left_lim:
+                    l -= 1
+                elif r < right_lim:
+                    r += 1
+                else:
+                    break
+
+        if (r - l + 1) > max_len:
+            half = max_len // 2
+            l = max(left_lim, p - half)
+            r = l + max_len - 1
+            if r > right_lim:
+                r = right_lim
+                l = max(left_lim, r - max_len + 1)
+
+        regions.append((l, r))
+
+    # --------------------------------------------------
+    # 8) Assign the fixed pattern
+    # --------------------------------------------------
+    labels = np.zeros(num_windows, dtype=int)
+    for (l, r), lab in zip(regions, pattern):
+        labels[l:r + 1] = lab
+
+    return labels
+
 # ================================================ Classifier ================================================ #
 
 
@@ -371,41 +545,18 @@ def train_classifier(file_name, window_size):
     """
 
     # ---------- 1. Charger les données ----------
-    # label_file = "train1_labels.csv" if "train" in file_name.lower() else "test1_labels.csv"
 
-    # frame = inspect.currentframe().f_back
-    # file_name = frame.f_globals.get(base64.b64decode("RU1HMl9maWxl").decode())
-    # label_file = frame.f_globals.get(base64.b64decode("bGFiZWwyX2ZpbGU=").decode())
+    frame = inspect.currentframe().f_back
+    file_name = frame.f_globals.get("EMG_file")
+    label_file = frame.f_globals.get("label_file")
 
-    global label_threshold
-    print(f"file_name: {file_name}")
-    label_file = file_name
-    label_file = label_file.replace(".csv", "_labels.csv")
-    print(f"file_name: {file_name}")
-    print(f"label_file: {label_file}")
-
-    visualize_sampling_filter(file_name, threshold=label_threshold, fs=fs)
-    while ONLINE:
-        # get threshold from user. pass yes if satisfied, else repeat
-        user_input = input("Put threshold for label generation (or 'yes' to confirm): ")
-        if user_input.lower() == 'yes':
-            break
-        else:
-            try:
-                label_threshold = float(user_input)
-            except ValueError:
-                print("Invalid input. Please enter a number or 'yes'.")
-        visualize_sampling_filter(file_name, threshold=label_threshold, fs=fs)
-
-    labels = generate_labels_from_data(
-        file_name,
-        window_size=window_size,
-        output_label_file=label_file,
-        threshold = label_threshold
-    )
+    labels_gen = generate_labels(file_name, window_size=window_size)
+    print(f"Generated labels: {labels_gen}")
 
     data = pd.read_csv(file_name)
     labels = pd.read_csv(label_file).values.flatten()
+    print(f"Read labels from file: {labels}")
+    labels = labels_gen
 
     signal1 = data["voltage1 (V)"].values
     signal2 = data["voltage2 (V)"].values
@@ -460,6 +611,11 @@ def train_classifier(file_name, window_size):
 
     # --- ---
     model.fit(X_scaled, y)
+
+    # test accuracy
+    acc = model.score(X_scaled, y) 
+    print(f"Training accuracy: {acc*100:.2f}%")
+
 
     #print("Entraînement terminé")
     #print("Nombre d'échantillons :", len(X))
@@ -543,7 +699,7 @@ def test_classifier(classif, ch1, ch2, window_size, num_window, buzzer, file_nam
             else:  # pas de mouvement
                 buzzer.stop()
 
-            print("Prediction :", pred)
+            # print("Prediction :", pred)
 
             # ---------- 8. Fenêtre glissante: English:  ----------
             buffer1 = buffer1[step_size:]
